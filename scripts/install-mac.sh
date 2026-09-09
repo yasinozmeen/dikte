@@ -141,7 +141,23 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # main() can show a useful reinstall message.
 PY_HOME="$("$PY" -c 'import sys; print(sys.base_prefix)')"
 PY_SITE="$("$PY" -c 'import site; print(site.getsitepackages()[0])')"
-PY_LIBRARY="$("$PY" -c 'import os, sys, sysconfig; print(os.path.realpath(os.path.join(sys.base_prefix, "Python")) if sysconfig.get_config_var("PYTHONFRAMEWORK") else os.path.realpath(os.path.join(sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("LDLIBRARY"))))')"
+# Only a framework or a shared libpython can be loaded at runtime. A static
+# CPython (pyenv's default, or any build without --enable-shared) reports a
+# libpython3.x.a here; that file exists, so a bare stat() would pass, but
+# dlopen() cannot load an archive and the launcher would fail on every start.
+# Leave PY_LIBRARY empty in that case so the native host is not chosen, and
+# never let this probe abort the install under set -e.
+PY_LIBRARY="$("$PY" -c '
+import os, sys, sysconfig
+cv = sysconfig.get_config_var
+path = ""
+if cv("PYTHONFRAMEWORK"):
+    path = os.path.join(sys.base_prefix, "Python")
+elif cv("Py_ENABLE_SHARED") and cv("LIBDIR") and cv("LDLIBRARY"):
+    path = os.path.join(cv("LIBDIR"), cv("LDLIBRARY"))
+path = os.path.realpath(path) if path else ""
+print(path if path and os.path.isfile(path) and not path.endswith(".a") else "")
+' 2>/dev/null || true)"
 
 # Encode every path byte as a fixed-width octal escape. Quoting only backslashes
 # and double quotes is not enough for legal macOS names containing newlines or
@@ -222,17 +238,49 @@ int main(int argc, char *argv[]) {
 }
 EOF
 
-# Try compiling the lightweight C wrapper
+# Compiling proves nothing about whether Python can be loaded: the host links
+# only libSystem and finds libpython at runtime. Before choosing it, build a
+# one-line probe that performs the same dlopen + dlsym(Py_BytesMain) the host
+# will, and keep the shell wrapper when the probe cannot load the library.
+NATIVE_SKIP_REASON=""
+if ! command -v clang >/dev/null 2>&1; then
+    NATIVE_SKIP_REASON="clang is not installed"
+elif [ -z "$PY_LIBRARY" ]; then
+    NATIVE_SKIP_REASON="this Python has no framework or shared libpython (built without --enable-shared)"
+else
+    PROBE_SRC="$(mktemp -t dikte_probe.XXXXXX.c)"
+    PROBE_BIN="${PROBE_SRC%.c}"
+    cat > "$PROBE_SRC" <<EOF
+#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    void *python = dlopen($C_PY_LIBRARY, RTLD_NOW | RTLD_GLOBAL);
+    if (!python) { fprintf(stderr, "%s\n", dlerror()); return 1; }
+    if (!dlsym(python, "Py_BytesMain")) { fputs("Py_BytesMain not exported\n", stderr); return 2; }
+    return 0;
+}
+EOF
+    if ! clang -x c "$PROBE_SRC" -o "$PROBE_BIN" 2>/dev/null; then
+        NATIVE_SKIP_REASON="the runtime probe did not compile"
+    elif ! probe_error="$("$PROBE_BIN" 2>&1 >/dev/null)"; then
+        NATIVE_SKIP_REASON="libpython cannot be loaded at runtime: ${probe_error:-unknown dlopen error}"
+    fi
+    rm -f "$PROBE_SRC" "$PROBE_BIN"
+fi
+
 COMPILED_NATIVE=0
-if command -v clang >/dev/null 2>&1; then
+if [ -z "$NATIVE_SKIP_REASON" ]; then
     if clang -x c "$LAUNCHER_SRC" -o "$APP/Contents/MacOS/Dikte" 2>/dev/null; then
         COMPILED_NATIVE=1
+    else
+        NATIVE_SKIP_REASON="the native launcher did not compile"
     fi
 fi
 rm -f "$LAUNCHER_SRC"
 
 if [ $COMPILED_NATIVE -eq 0 ]; then
-    warn "Could not compile native launcher. Falling back to bash wrapper (macOS 26 menu bar icon may break)."
+    rm -f "$APP/Contents/MacOS/Dikte"
+    warn "Native launcher skipped: $NATIVE_SKIP_REASON. Falling back to the shell wrapper (macOS 26 menu bar icon may break)."
 
     PY_REAL="$("$PY" -c 'import os, sys; print(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))')"
     cp -f "$PY_REAL" "$APP/Contents/MacOS/python3"
