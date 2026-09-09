@@ -42,9 +42,12 @@ class Directories(unittest.TestCase):
 
     def test_a_mac_does_not_read_the_xdg_variables(self):
         """A Mac with them set from some other tool still stores in one place."""
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/c"}):
+        # Something no temporary directory can be called: the home this runs
+        # under is a mkdtemp path, and a two-letter needle matched the "/c" in
+        # somebody's TMPDIR rather than the variable being read.
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/xdg-elsewhere"}):
             config_dir, _ = paths.directories("darwin")
-        self.assertNotIn("/c", config_dir.as_posix())
+        self.assertNotIn("xdg-elsewhere", config_dir.as_posix())
 
     def test_windows_keeps_the_models_out_of_the_roaming_profile(self):
         """Settings roam with the account; several gigabytes must not."""

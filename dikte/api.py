@@ -1,10 +1,17 @@
-"""OpenAI, Groq, OpenRouter and this machine, stdlib only.
+"""OpenAI, Groq, OpenRouter, Google AI Studio and this machine, stdlib only.
 
-Transcription runs on any of the four: Groq and OpenRouter both mirror OpenAI's
-/audio/transcriptions endpoint field for field, and ggml.py starts whisper.cpp
-on that same path, so one multipart request serves all of them and only the key,
-the base URL and the model id change. llama.cpp answers /chat/completions the way
-OpenRouter does, so cleanup here is the same request too.
+Transcription runs on the first three and on this machine: Groq and OpenRouter
+both mirror OpenAI's /audio/transcriptions endpoint field for field, and ggml.py
+starts whisper.cpp on that same path, so one multipart request serves all of
+them and only the key, the base URL and the model id change. llama.cpp answers
+/chat/completions the way OpenRouter does, so cleanup here is the same request
+too.
+
+Google AI Studio is here for cleanup and nothing else. Its OpenAI-compatible
+endpoint answers /chat/completions and /models, but there is no
+/audio/transcriptions behind it: audio only goes in as base64 inside a chat
+message, and what comes back has none of the segment times a subtitle file or a
+meeting transcript is built out of.
 
 What is on this machine has no key, and its base URL is not known until a server
 is up, which is the one thing this module has to fill in for it.
@@ -31,6 +38,7 @@ USER_AGENT = f"dikte/1.0 (+{APP_URL})"
 OPENAI_URL = "https://api.openai.com/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 # The floor for a local request. The timeouts elsewhere are sized for a hosted
 # API, where a slow answer is a bill running; here the only thing being spent is
@@ -40,22 +48,33 @@ LOCAL_TIMEOUT = 3600
 
 # Where a transcription request goes; built by config.Config.transcribe_target().
 # `service` is the name the user sees in an error, `provider` the one the code
-# branches on.
-Target = collections.namedtuple("Target", "provider service api_key base_url model")
+# branches on. `file_model` is what a timestamped run asks for instead of
+# `model`, where the two differ; empty means the provider's own whisper.
+Target = collections.namedtuple(
+    "Target", "provider service api_key base_url model file_model",
+    defaults=[""])
+
+# What answers with segment times on OpenRouter when nothing else was chosen.
+OPENROUTER_FILE_MODEL = "openai/whisper-1"
 
 
-def timestamp_model(provider, selected=""):
+def timestamp_model(provider, selected="", file_model=""):
     """Which model answers with segment times.
 
-    OpenAI keeps them to whisper-1 and OpenRouter namespaces that id. Everything
-    Groq transcribes with is a whisper, so the model already chosen does it and
-    the fallback is only for a provider left on its default. So is everything the
-    local server runs, whatever the file is called, and there asking for another
-    model would name one it has never heard of.
+    OpenAI keeps them to whisper-1. Everything Groq transcribes with is a
+    whisper, so the model already chosen does it and the fallback is only for a
+    provider left on its default. So is everything the local server runs,
+    whatever the file is called, and there asking for another model would name
+    one it has never heard of. OpenRouter fronts several models that do times
+    and several that do not, and a request to the wrong one gets a transcript
+    with no segments in it, so the one to use is a setting of its own
+    (`file_model`) and whisper-1 is only where that setting is left empty.
     """
     if provider in ("groq", "local"):
         return selected or "whisper-large-v3-turbo"
-    return "openai/whisper-1" if provider == "openrouter" else "whisper-1"
+    if provider == "openrouter":
+        return file_model or OPENROUTER_FILE_MODEL
+    return "whisper-1"
 
 
 # What a gateway in front of the model answers of its own accord: the request
@@ -254,9 +273,22 @@ def _request(url, data, headers, timeout=120, aborter=None):
 
 
 def _extract_error(body):
+    """The line worth showing out of a failed request's body.
+
+    Whatever comes back, this has to end in a string: it is called while an
+    ApiError is being raised, and an exception thrown here would escape the
+    `except ApiError` every caller is holding and lose the dictation the raw
+    transcript would otherwise have been pasted from.
+    """
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
+        return body[:300]
+    if isinstance(payload, list):
+        # Google answers some failures with an array holding the object the
+        # other providers send on its own.
+        payload = next((item for item in payload if isinstance(item, dict)), None)
+    if not isinstance(payload, dict):
         return body[:300]
     err = payload.get("error")
     if isinstance(err, dict):
@@ -335,7 +367,8 @@ def local_failure(service, server, exc):
 
 
 def _transcribe_request(target, audio_path, language, prompt, response_format,
-                        granularity=None, timeout=300, aborter=None):
+                        granularity=None, timeout=300, aborter=None,
+                        detect_language=False):
     if target.provider == "local":
         # The timeouts here are sized for a hosted API, where a slow answer is a
         # bill running. Locally the only thing being spent is time.
@@ -347,20 +380,31 @@ def _transcribe_request(target, audio_path, language, prompt, response_format,
     fields = [("model", target.model), ("response_format", response_format)]
     if language and language != "auto":
         fields.append(("language", language))
+    if detect_language:
+        # whisper.cpp was started with -nlp, which keeps the language
+        # probability sweep off every request. Detection is only worth that
+        # sweep for the run that asked for it, so it is switched back on here,
+        # per request, and reported in the verbose_json answer.
+        fields.append(("no_language_probabilities", "false"))
     # OpenRouter takes the hint field and throws it away, so spare it the bytes.
     # The same words still reach the cleanup model as a glossary. whisper.cpp
     # takes it as the initial prompt, the way OpenAI does.
     if prompt and target.provider != "openrouter":
         fields.append(("prompt", prompt))
-    if granularity:
-        fields.append(("timestamp_granularities[]", granularity))
+    for level in granularity or ():
+        fields.append(("timestamp_granularities[]", level))
     body, ctype = _multipart(fields, "file", audio_path)
+    # An hour of meeting takes the local server a while, and the idle unload has
+    # to count that as the model being used rather than as nobody wanting it.
+    held = (ggml.whisper.busy() if target.provider == "local"
+            else contextlib.nullcontext())
     try:
-        return _request(
-            f"{target.base_url.rstrip('/')}/audio/transcriptions", body,
-            _headers(target.provider, target.api_key, ctype), timeout=timeout,
-            aborter=aborter,
-        )
+        with held:
+            return _request(
+                f"{target.base_url.rstrip('/')}/audio/transcriptions", body,
+                _headers(target.provider, target.api_key, ctype), timeout=timeout,
+                aborter=aborter,
+            )
     except ApiError as exc:
         if target.provider == "local":
             raise local_failure(target.service, ggml.whisper, exc) from None
@@ -406,6 +450,96 @@ def _merge_word_splits(segments):
     return merged
 
 
+# A cue built here is one a reader has time for: about two lines of subtitle,
+# and no longer on screen than a sentence takes to say. Neither is a hard rule
+# for a sentence that ends early, only the point past which one is broken.
+MAX_CUE_SECONDS = 7.0
+MAX_CUE_CHARS = 84
+# The other end of it: a cue nobody can read because it was gone before they
+# looked. A full stop this early in a cue is not the end of anything worth
+# breaking on, which is what "1." and "Dr." are, and a cue that ends up short
+# anyway is held on screen until the next one needs the space.
+MIN_CUE_SECONDS = 1.2
+# No whisper segment is longer than the window it was heard in, so a segment
+# that runs past this came from a model that is not marking segments at all.
+WHISPER_WINDOW = 30.0
+SENTENCE_END = ".!?…"
+
+
+def _too_coarse(segments):
+    """Whether these segments are too long to be cues, or are not there at all.
+
+    Not every model behind /audio/transcriptions marks segments the way whisper
+    does. Some fill the field with one entry per paragraph, or with a single one
+    covering the whole file, which turns a fourteen minute video into three
+    subtitles. Word times are what those models do give, and cues built from
+    them are better than what the segments would have been.
+    """
+    if not segments:
+        return True
+    return any(float(seg.get("end") or 0.0) - float(seg.get("start") or 0.0)
+               > WHISPER_WINDOW for seg in segments)
+
+
+def cues_from_words(words):
+    """[(start, end, text)] cut out of word times, where segments were no use.
+
+    A cue ends where a sentence does, and failing that wherever it has grown too
+    long to read or too long to leave up. Nothing is ever cut between two words:
+    the times that arrive are per word, and so are the ones that leave.
+    """
+    cues = []
+    start = end = 0.0
+    current = []
+
+    def flush():
+        nonlocal current
+        if current:
+            cues.append((start, max(end, start), " ".join(current)))
+            current = []
+
+    for word in words:
+        text = (word.get("word") or "").strip()
+        if not text:
+            continue
+        at = float(word.get("start") or 0.0)
+        until = float(word.get("end") or at)
+        if current:
+            grown = len(" ".join(current)) + 1 + len(text)
+            if grown > MAX_CUE_CHARS or until - start > MAX_CUE_SECONDS:
+                flush()
+        if not current:
+            start = at
+        current.append(text)
+        end = until
+        # A sentence can end inside the punctuation that closes a quote. What
+        # is too short to have been a sentence is a list marker or a shortened
+        # word, and the cue goes on rather than ending on it.
+        if (end - start >= MIN_CUE_SECONDS
+                and text.rstrip("\"')]»”’").endswith(tuple(SENTENCE_END))):
+            flush()
+    flush()
+    return _held(cues)
+
+
+def _held(cues):
+    """Keep a cue that is still too short on screen, without covering the next.
+
+    A one word sentence is a fifth of a second of audio and so a fifth of a
+    second of subtitle, which is a flicker. It stays up until the cue after it
+    starts, or for as long as it takes to read, whichever comes first.
+    """
+    out = []
+    for index, (start, end, text) in enumerate(cues):
+        if end - start < MIN_CUE_SECONDS:
+            room = start + MIN_CUE_SECONDS
+            if index + 1 < len(cues):
+                room = min(room, cues[index + 1][0])
+            end = max(end, room)
+        out.append((start, end, text))
+    return out
+
+
 def transcribe(target, audio_path, language="", prompt="", timeout=300, aborter=None):
     data = _transcribe_request(
         target, audio_path, language, prompt, "json", timeout=timeout, aborter=aborter
@@ -419,17 +553,75 @@ def transcribe(target, audio_path, language="", prompt="", timeout=300, aborter=
     return text
 
 
+# whisper.cpp reports what it heard as a lowercase full name ("turkish",
+# "english", "german"…); the settings and the cleanup prompt speak in two-letter
+# codes. Only the handful Dikte offers as a fixed choice get a code; anything
+# else is left as the empty string, which the caller reads as "unknown" rather
+# than guessing at a language it has no label for.
+_DETECTED_TO_CODE = {
+    "english": "en", "turkish": "tr", "german": "de",
+    "french": "fr", "spanish": "es", "arabic": "ar",
+}
+
+
+def transcribe_detected(target, audio_path, language="", prompt="", timeout=300,
+                        aborter=None):
+    """(text, code) with the language the model heard.
+
+    The spoken language is only knowable when the transcription model reports
+    it, and only whisper.cpp does: the hosted endpoints accept "auto" but never
+    say what they heard. So detection is asked for exactly where it can be
+    answered, the local server in auto mode, and every other run transcribes
+    as before and hands back an empty code.
+    """
+    if target.provider == "local" and language == "auto":
+        data = _transcribe_request(
+            target, audio_path, language, prompt, "verbose_json",
+            detect_language=True, timeout=timeout, aborter=aborter,
+        )
+        text = _local_text(data.get("text") or "").strip()
+        if not text:
+            raise ApiError(t("Transcript came back empty."))
+        detected = data.get("detected_language")
+        code = _DETECTED_TO_CODE.get(
+            detected.strip().lower(), "") if isinstance(detected, str) else ""
+        return text, code
+    text = transcribe(target, audio_path, language=language, prompt=prompt,
+                      timeout=timeout, aborter=aborter)
+    return text, ""
+
+
 def transcribe_segments(target, audio_path, language="", prompt="", timeout=300,
                         aborter=None):
     """[(start_seconds, end_seconds, text)] using whisper-1's verbose response."""
-    data = _transcribe_request(
-        target._replace(model=timestamp_model(target.provider, target.model)),
-        audio_path, language, prompt, "verbose_json",
-        granularity="segment", timeout=timeout, aborter=aborter,
-    )
+    target = target._replace(model=timestamp_model(target.provider, target.model,
+                                                   target.file_model))
+    ask = dict(language=language, prompt=prompt, response_format="verbose_json",
+               timeout=timeout, aborter=aborter)
+    # Word times are the way out of a model that does not mark segments, and
+    # whisper.cpp is not one of those, so the local server is only ever asked
+    # for what it has always been asked for. A hosted model that refuses the
+    # field says so with a 400, and the request it used to answer is still
+    # there to fall back on rather than losing the run over a field it did not
+    # need in the first place.
+    if target.provider == "local":
+        data = _transcribe_request(target, audio_path, granularity=("segment",), **ask)
+    else:
+        try:
+            data = _transcribe_request(target, audio_path,
+                                       granularity=("segment", "word"), **ask)
+        except ApiError as exc:
+            if exc.status != 400:
+                raise
+            data = _transcribe_request(target, audio_path,
+                                       granularity=("segment",), **ask)
     segments = data.get("segments") or []
     if target.provider == "local":
         segments = _merge_word_splits(segments)
+    if _too_coarse(segments):
+        cues = cues_from_words(data.get("words") or [])
+        if cues:
+            return cues
     out = []
     for seg in segments:
         text = (seg.get("text") or "").strip()
@@ -448,14 +640,24 @@ def transcribe_segments(target, audio_path, language="", prompt="", timeout=300,
     return out
 
 
+# The settings window offers OpenRouter's ladder, and Google has neither end of
+# it: "none" is refused outright with a 400, and there is nothing above "high".
+# Both ends land on the nearest rung that does exist, which costs the cleanup
+# rather than the dictation when it is wrong. "minimal" is where "off" goes, and
+# it is the quickest of them by a wide margin, which is what cleanup wants
+# anyway.
+GEMINI_EFFORT = {"none": "minimal", "xhigh": "high", "max": "high"}
+
+
 def _thinking(payload, provider, reasoning):
     """Ask for as much thinking as this provider understands, or for none.
 
     An empty level means "whatever the model does on its own", so nothing is
-    sent. The two mean opposite things by that, which is why the setting is kept
-    per provider: OpenRouter's cleanup models answer straight away, while a local
-    model that was trained to think will think, and cleanup is punctuation rather
-    than a job worth thinking about.
+    sent. The three mean opposite things by that, which is why the setting is
+    kept per provider: OpenRouter's cleanup models answer straight away, while a
+    local model that was trained to think will think, and a Gemini Flash left to
+    itself thinks too. Cleanup is punctuation rather than a job worth thinking
+    about.
     """
     if not reasoning:
         return
@@ -463,27 +665,77 @@ def _thinking(payload, provider, reasoning):
         # What llama.cpp passes to the chat template. The models that think read
         # it; the ones that do not ignore it.
         payload["chat_template_kwargs"] = {"enable_thinking": reasoning != "none"}
+    elif provider == "gemini":
+        # Google's compatibility layer takes OpenAI's flat field rather than
+        # OpenRouter's object, and it has no word for off, so "none" is asked
+        # for as the lowest rung it has rather than skipped: a Flash model left
+        # to decide for itself thinks, and thinking about a comma is the second
+        # this provider was chosen to save.
+        payload["reasoning_effort"] = GEMINI_EFFORT.get(reasoning, reasoning)
     elif reasoning != "none":
         # The thinking itself is never shown, so ask for it to be left out.
         payload["reasoning"] = {"effort": reasoning, "exclude": True}
 
 
-def local_ceiling(text):
+# Room for the thinking on this machine, one budget per rung of the settings
+# ladder. llama.cpp counts the thinking towards max_tokens along with the answer
+# it precedes, so a ceiling sized for the answer alone leaves a model that
+# thinks nothing to answer with. The rungs double, starting where a small model
+# lands when it barely thinks at all: cleanup is punctuation, and locally every
+# one of these tokens is also a second of somebody standing in front of the
+# screen, so the low rungs are the ones meant to be used.
+THINKING_ROOM = {
+    "minimal": 256, "low": 512, "medium": 1024,
+    "high": 2048, "xhigh": 4096, "max": 8192,
+}
+# An empty setting leaves it to the model, and the templates that can think
+# think by default. Room for a middling amount of it, since there is no way to
+# ask which kind of model this is.
+DEFAULT_THINKING_ROOM = THINKING_ROOM["medium"]
+
+
+def local_ceiling(text, reasoning="", context=0, prompt=""):
     """How much of a reply is worth waiting for from a model on this machine.
 
     Cleanup gives back what it was given, near enough, so a reply several times
     the length of the transcript is a model that has lost the thread rather than
     one doing the job. A small one will happily repeat the transcript until the
     context is full, and every one of those tokens is a second of somebody
-    waiting. A hosted model is left alone: there the same runaway is rare, and a
-    ceiling would cut the minutes short instead.
+    waiting, with only the hour-long local timeout underneath. A hosted model is
+    left alone: there the same runaway is rare, and a ceiling would cut the
+    minutes short instead.
+
+    The answer's share is the transcript's length in characters spent as a
+    budget in tokens, so what it really allows is two to four times the
+    transcript depending on how well the language tokenises. Turkish sits at the
+    tight end of that and still has room to spare for a reply that is meant to
+    come back the same length it went in.
+
+    Thinking is added on top of that share rather than taken out of it. Sharing
+    one budget is what makes turning thinking up quietly cost the answer, and on
+    a short dictation the 512 floor is the whole budget, so the answer is what
+    goes missing first.
+
+    `context` is what the server was started with, and the whole of it is the
+    real limit whatever is asked for here: a ceiling above it is not a ceiling,
+    because the runaway it exists to stop would run to the end of the context
+    instead. So the ceiling is held below what the prompt leaves. Two characters
+    to the token is under any tokeniser's rate for natural language, Turkish
+    included, which makes the reserve an over-estimate rather than a promise of
+    room that is not there.
     """
-    return max(512, len(text))
+    answer = max(512, len(text))
+    if reasoning != "none":
+        answer += THINKING_ROOM.get(reasoning, DEFAULT_THINKING_ROOM)
+    context = int(context or 0)
+    if not context:
+        return answer
+    return max(256, min(answer, context - (len(prompt) + len(text)) // 2))
 
 
 def cleanup(text, api_key, model, system_prompt, reasoning="",
             base_url=OPENROUTER_URL, timeout=180, provider="openrouter",
-            service="OpenRouter", aborter=None):
+            service="OpenRouter", aborter=None, context=0):
     if not api_key and provider != "local-llm":
         raise ApiError(t("{service} API key is empty. Add it in Settings.",
                          service=service))
@@ -496,7 +748,8 @@ def cleanup(text, api_key, model, system_prompt, reasoning="",
         ],
     }
     if provider == "local-llm":
-        payload["max_tokens"] = local_ceiling(text)
+        payload["max_tokens"] = local_ceiling(text, reasoning, context,
+                                              system_prompt)
     _thinking(payload, provider, reasoning)
     try:
         data = _request(
@@ -520,19 +773,27 @@ def cleanup(text, api_key, model, system_prompt, reasoning="",
             raise ApiError(t("The cleanup model spent its whole reply on "
                              "thinking. Set Thinking to \u201cOff\u201d."))
         raise ApiError(t("The cleanup model returned an empty reply."))
+    if choices[0].get("finish_reason") == "length":
+        # Cut off at somebody's ceiling: ours locally, the provider's otherwise.
+        # What came back is a sentence that stops mid-word, and cleanup is meant
+        # to hand back the whole dictation, so the half is refused rather than
+        # returned. The callers keep the transcript they started with, which is
+        # the better of the two.
+        raise ApiError(t("The cleanup model was cut off before it finished."))
     return content
 
 
 def chat(messages, api_key, model, system_prompt, reasoning="",
-         base_url=OPENROUTER_URL, timeout=180):
+         base_url=OPENROUTER_URL, timeout=180, provider="openrouter",
+         service="OpenRouter"):
     """A conversation, rather than one transcript rewritten.
 
     The messages are the whole history and come back unchanged; the caller keeps
-    them, because there is no session on OpenRouter's side to resume.
+    them, because there is no session on the provider's side to resume.
     """
     if not api_key:
         raise ApiError(t("{service} API key is empty. Add it in Settings.",
-                         service="OpenRouter"))
+                         service=service))
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}] + list(messages),
@@ -543,17 +804,22 @@ def chat(messages, api_key, model, system_prompt, reasoning="",
         data = _request(
             f"{base_url.rstrip('/')}/chat/completions",
             json.dumps(payload).encode("utf-8"),
-            _headers("openrouter", api_key, "application/json"),
+            _headers(provider, api_key, "application/json"),
             timeout=timeout,
         )
     except ApiError as exc:
-        raise explain(exc, "OpenRouter") from None
+        raise explain(exc, service) from None
     choices = data.get("choices") or []
     if not choices:
         raise ApiError(_extract_error(json.dumps(data)))
     content = ((choices[0].get("message") or {}).get("content") or "").strip()
     if not content:
         raise ApiError(t("The model returned an empty reply."))
+    if choices[0].get("finish_reason") == "length":
+        # An answer that stops mid-sentence reads like a whole one once it has
+        # been pasted, so it is refused here for the same reason cleanup refuses
+        # a half transcript.
+        raise ApiError(t("The model was cut off before it finished."))
     return content
 
 
@@ -609,6 +875,37 @@ def openrouter_models(api_key="", transcription=False):
                   if "transcription" in (m.get("architecture") or {}).get(
                       "output_modalities", [])]
     return sorted(m["id"] for m in models if m.get("id"))
+
+
+# What a `gemini` id can be besides a model that answers a chat request: an
+# embedding, a picture, or a voice. None of them is any use to cleanup.
+NOT_CHAT = ("embedding", "-image", "-tts", "-audio")
+
+
+def gemini_models(api_key, base_url=GEMINI_URL):
+    """The Gemini models Google AI Studio will answer a chat request with.
+
+    Google serves its embedding, image and speech models out of the same list
+    and names them all `gemini` too, so the prefix alone is not the question;
+    none of those can clean up a sentence. The listing has also been known to
+    hand the ids back in their long form, `models/gemini-3.5-flash`, while a
+    request wants the short one; taking the prefix off costs nothing and is
+    right whichever form arrives.
+    """
+    service = "Google AI Studio"
+    if not api_key:
+        raise ApiError(t("{service} API key is empty. Add it in Settings.",
+                         service=service))
+    try:
+        data = _get_json(
+            f"{base_url.rstrip('/')}/models",
+            {"Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT},
+        )
+    except ApiError as exc:
+        raise explain(exc, service) from None
+    ids = [(m.get("id") or "").removeprefix("models/") for m in data.get("data", [])]
+    return sorted(i for i in ids
+                  if i.startswith("gemini") and not any(w in i for w in NOT_CHAT))
 
 
 def openai_models(api_key, base_url=OPENAI_URL, service="OpenAI"):

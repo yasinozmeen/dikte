@@ -121,6 +121,13 @@ def _digest(value):
     return value.split(":", 1)[1] if value.startswith("sha256:") else value
 
 
+def _assets(data):
+    return [Item(a.get("name") or "", a.get("browser_download_url") or "",
+                 int(a.get("size") or 0), _digest(a.get("digest")))
+            for a in (data.get("assets") or [])
+            if a.get("browser_download_url")]
+
+
 def release(repo, tag="latest", refresh=False):
     """(tag, [Item]) for one GitHub release, newest when no tag is given."""
     where = "latest" if tag in ("", "latest") else f"tags/{tag}"
@@ -128,10 +135,47 @@ def release(repo, tag="latest", refresh=False):
                   f"{GITHUB_API}/repos/{repo}/releases/{where}", refresh=refresh)
     if not isinstance(data, dict) or not data.get("assets"):
         raise HubError(t("{repo} has no downloadable release.", repo=repo))
-    assets = [Item(a.get("name") or "", a.get("browser_download_url") or "",
-                   int(a.get("size") or 0), _digest(a.get("digest")))
-              for a in data["assets"] if a.get("browser_download_url")]
-    return data.get("tag_name") or tag, assets
+    return data.get("tag_name") or tag, _assets(data)
+
+
+def releases(repo, limit=20, refresh=False):
+    """[(tag, [Item])] for the recent releases, newest first, with their files.
+
+    "latest" is one release and this is the list behind it, prereleases
+    included: a project that attaches its builds to a prerelease is invisible
+    to release() above, and its newest usable build is in here.
+    """
+    data = _fetch(f"gh-list-{repo}-{limit}",
+                  f"{GITHUB_API}/repos/{repo}/releases?per_page={limit}",
+                  refresh=refresh)
+    if not isinstance(data, list):
+        raise HubError(t("{repo} has no downloadable release.", repo=repo))
+    out = []
+    for entry in data:
+        tag, items = entry.get("tag_name") or "", _assets(entry)
+        if tag and items:
+            out.append((tag, items))
+    return out
+
+
+def text(url, limit=4096, timeout=20):
+    """A small text file from a release, as a string.
+
+    Not cached and not checksummed, because what it carries is a pointer: a few
+    bytes naming the release the actual archives are attached to, read once on
+    the way to a download that is checked in full.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read(limit).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise HubError(t("{url} answered HTTP {code}.",
+                         url=urllib.parse.urlsplit(url).netloc, code=exc.code)) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise HubError(t("Could not reach {url}: {error}",
+                         url=urllib.parse.urlsplit(url).netloc, error=exc)) from exc
 
 
 def newest_release(repo, refresh=False):

@@ -12,11 +12,17 @@ Python standart kütüphanesi (3.11 veya üstü) ve PyQt6.
 *[English README](README.md)*
 
 <p align="center">
-  <img src="docs/settings-general.webp" width="820" alt="Dikte ayarları, Genel sekmesi">
+  <img src="docs/home.webp" width="620" alt="Dikte, Nord teması">
+  <br><sub>Nord (varsayılan)</sub>
 </p>
+
+| Dracula | Klasik karanlık | Klasik beyaz |
+|---|---|---|
+| <img src="docs/home-dracula.webp" width="270" alt="Dikte, Dracula"> | <img src="docs/home-dark.webp" width="270" alt="Dikte, Klasik karanlık"> | <img src="docs/home-light.webp" width="270" alt="Dikte, Klasik beyaz"> |
 
 |  |  |
 |---|---|
+| <img src="docs/settings-general.webp" width="410" alt="Genel ve temalar"> | <img src="docs/settings-display.webp" width="410" alt="Nord, Dracula, dark, light"> |
 | <img src="docs/settings-api.webp" width="410" alt="API ve modeller"> | <img src="docs/settings-cleanup.webp" width="410" alt="Temizleme kuralları"> |
 | <img src="docs/settings-agent.webp" width="410" alt="Ajan"> | <img src="docs/settings-meeting.webp" width="410" alt="Toplantı"> |
 | <img src="docs/settings-audio-file.webp" width="410" alt="Ses dosyası"> | <img src="docs/settings-shortcuts.webp" width="410" alt="Kısayollar"> |
@@ -112,10 +118,14 @@ Sesi yazıya çevirme ve temizleme, ayarlar penceresinde ayrı ayrı sağlayıc�
 seçer; ikisi de varsayılan olarak burada, kendi modellerinle çalışır. Bulutu
 seçersen sesi yazıya çevirme **OpenAI**, **Groq** ya da **OpenRouter**'da
 (varsayılan `gpt-4o-transcribe`), temizleme OpenRouter'da
-(`google/gemini-3.5-flash-lite`) ya da kuruluysa Claude Code veya Codex'te
-çalışır. Anahtarları boş bırakırsan `OPENAI_API_KEY`, `GROQ_API_KEY` ve
-`OPENROUTER_API_KEY` kullanılır; anahtarlar `~/.config/dikte/config.json`
-içinde, izinler 600, Mac'te ise `~/Library/Application Support/Dikte` altında.
+(`google/gemini-3.5-flash-lite`), **Google AI Studio**'da
+(`gemini-3.5-flash-lite`), **OpenCode Go**'da (`deepseek-v4-flash`) ya da
+kuruluysa Claude Code, Codex veya Antigravity'de çalışır. İlk üçü tek bir HTTP
+isteği; üç CLI ise bunun için birer oturum açar, fazladan giden birkaç saniye de
+oradan gelir. Anahtarları boş bırakırsan `OPENAI_API_KEY`, `GROQ_API_KEY`,
+`OPENROUTER_API_KEY`, `GEMINI_API_KEY` ve `OPENCODE_API_KEY` kullanılır;
+anahtarlar `~/.config/dikte/config.json` içinde, izinler 600, Mac'te ise
+`~/Library/Application Support/Dikte` altında.
 Temizlemeyi tamamen kapatabilirsin, o zaman ham transkript yapıştırılır; modelin
 yanındaki kutudan düşünme seviyesini de seçebilirsin.
 
@@ -154,8 +164,13 @@ olmasını ister.
   whisper.cpp, temizleme llama.cpp üzerinde; ikisini de önceden kurman gerekmez:
   ayarlar penceresi programı ve modeli indirir, sha256'sını doğrular,
   checksum'suz yayınlanmış bir indirmeyi reddeder, sen dikte ettikçe sunucuyu
-  ayakta tutar. Derleme destekliyorsa ekran kartına CUDA, ROCm ya da Vulkan
+  ayakta tutar ve on dakika kullanılmayan modelin belleğini geri verir. Model
+  listesi dosya boyutuna değil modele göre gruplanır ve bu
+  makinenin belleğine ve ekran kartına uyan satır işaretlenir. Derleme
+  destekliyorsa ekran kartına CUDA, ROCm ya da Vulkan
   üzerinden ulaşılır. Anahtar yok, hesap yok, makineden çıkan bir şey yok.
+  x86_64 Linux'ta aynı düğme, whisper-server'ın Dikte'nin kendi yayınladığı
+  Vulkan derlemesini indirir; upstream'in Linux arşivi yalnızca işlemci için.
 - **Sessizlik API'ye gitmez.** Sessize yakın bir ses verildiğinde model boş dize
   döndürmez, bir cümle uydurur ("Altyazı M.K.", "Thanks for watching"). *O
   kaydın kendi* gürültü tabanının 10 dB üstüne en az 0,3 saniye çıkan bir şey
@@ -184,9 +199,11 @@ olmasını ister.
   yapıştırır: cevabı ya da ne yapıldığını söyleyen bir cümle. Kendi açacağın
   oturumun aynısıdır, yani skill'lerin ve bağlı servislerin oradadır; "bunu
   perşembe üçe takvime koy" cümlesini Claude olmayan bir pencerede söyleyebilir
-  olmanı sağlayan da budur. Codex (`codex exec`) da aynı şekilde çalışır;
-  OpenRouter ise ikisi de kurulu olmayan bir makinede düz soru cevap için
-  duruyor. Sağlayıcı, model, izinler ve çalışma dizini Ayarlar → Ajan
+  olmanı sağlayan da budur. Codex (`codex exec`) ile Antigravity (`agy -p`) da
+  aynı şekilde çalışır; ama Antigravity'ye Dikte bir izin kipi ya da sandbox
+  veremiyor, sormadan ne yapabileceğini kendi allow-rule'ları belirliyor.
+  OpenRouter ya da OpenCode Go ise hiçbiri kurulu olmayan bir makinede düz soru
+  cevap için duruyor. Sağlayıcı, model, izinler ve çalışma dizini Ayarlar → Ajan
   sekmesinde; arka arkaya verilen komutlar tek bir konuşmada kalır.
 - **Toplantılar** mikrofonla hoparlör çıkışından aynı anda kaydedilir; kimin ne
   dediği tahmin edilmez, sesin hangi kanaldan geldiğiyle belli olur. İki taraf
@@ -203,6 +220,11 @@ olmasını ister.
   yerinde kalır, hiçbir şey kısaltılmaz.
 - **Geçmiş** Ayarlar → Geçmiş sekmesinde; boyut sınırı var, sağ tıklayıp
   silebilirsin.
+- **Konuşma dili seçilmez, algılanır.** Varsayılan otomatiktir: bu makinedeki
+  whisper ne duyduğunu söyler, bulut sağlayıcılar söylenmeden de hangi dilde
+  konuşuluyorsa o dilde yazar; algılanan dil geçmişe düşer ve bir kaydın hangi
+  temizleme promptunu alacağını belirler (Türkçe mi, dile duyarsız olanı mı).
+  Sabit bir dil yine de bunun önüne geçer.
 - **Türkçe ve İngilizce arayüz**, varsayılan olarak sistem dilini izler.
 
 ## Global kısayollar ve KDE'nin istediği oturum kapatma
@@ -233,9 +255,9 @@ cli.py            komut satırı: bütün fiiller ve verdikleri cevap
 ipc.py            yerel sokette bir istek, bir cevap
 audio.py          PCM kaydı: diktede pw-record, toplantıda ffmpeg
 meeting.py        kanal ayırma, konuşmacı etiketi, temizleme, tutanak
-assistant.py      dikteyi Claude Code, Codex ya da OpenRouter'dan geçirme
+assistant.py      dikteyi Claude Code, Codex, agy ya da sohbet modelinden geçirme
 api.py            transkript ve temizleme istekleri (yalnız stdlib)
-cleanup.py        transkripti kim temizler: OpenRouter, burası, Claude ya da Codex
+cleanup.py        transkripti kim temizler: bulutta bir model, burası, bir CLI
 ggml.py           whisper.cpp ve llama.cpp'yi indirip burada çalıştırma
 hub.py            GitHub ve Hugging Face'te bugün ne olduğu
 update.py         yeni sürüm çıkmış mı, çıkmışsa hangi sayfada

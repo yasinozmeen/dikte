@@ -13,11 +13,17 @@ library, 3.11 or newer, and PyQt6.
 *[Türkçe README](README.tr.md)*
 
 <p align="center">
-  <img src="docs/settings-general.webp" width="820" alt="Dikte settings, General tab">
+  <img src="docs/home.webp" width="620" alt="Dikte, Nord theme">
+  <br><sub>Nord (default)</sub>
 </p>
+
+| Dracula | Classic dark | Classic light |
+|---|---|---|
+| <img src="docs/home-dracula.webp" width="270" alt="Dikte, Dracula"> | <img src="docs/home-dark.webp" width="270" alt="Dikte, Classic dark"> | <img src="docs/home-light.webp" width="270" alt="Dikte, Classic light"> |
 
 |  |  |
 |---|---|
+| <img src="docs/settings-general.webp" width="410" alt="General and themes"> | <img src="docs/settings-display.webp" width="410" alt="Nord, Dracula, dark, light"> |
 | <img src="docs/settings-api.webp" width="410" alt="API and models"> | <img src="docs/settings-cleanup.webp" width="410" alt="Cleanup rules"> |
 | <img src="docs/settings-agent.webp" width="410" alt="Agent"> | <img src="docs/settings-meeting.webp" width="410" alt="Meeting"> |
 | <img src="docs/settings-audio-file.webp" width="410" alt="Audio file"> | <img src="docs/settings-shortcuts.webp" width="410" alt="Shortcuts"> |
@@ -115,9 +121,13 @@ or runs it on the spot.
 Speech to text and cleanup each pick a provider in the settings window, and both
 run here by default, on models of your own. The cloud is the other option:
 speech to text on **OpenAI**, **Groq** or **OpenRouter** (`gpt-4o-transcribe`),
-cleanup on OpenRouter (`google/gemini-3.5-flash-lite`) or, when either is
-installed, on Claude Code or Codex. The keys fall back to `OPENAI_API_KEY`,
-`GROQ_API_KEY` and `OPENROUTER_API_KEY`, and are stored in
+cleanup on OpenRouter (`google/gemini-3.5-flash-lite`), on **Google AI Studio**
+(`gemini-3.5-flash-lite`), on **OpenCode Go** (`deepseek-v4-flash`) or, when one
+of them is installed, on Claude Code, Codex or Antigravity. The first three are
+a single HTTP request; the three CLIs each open a whole session to do it, which
+is where their few extra seconds go. The keys fall back to `OPENAI_API_KEY`,
+`GROQ_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY` and `OPENCODE_API_KEY`,
+and are stored in
 `~/.config/dikte/config.json`, mode 600, or in
 `~/Library/Application Support/Dikte` on a Mac. Cleanup can be switched off, in
 which case the raw transcript is pasted, and a thinking model's effort can be
@@ -157,9 +167,14 @@ running.
 - **It all runs on this machine by default.** Speech to text on whisper.cpp and
   cleanup on llama.cpp, neither installed beforehand: the settings window fetches
   the program and the model, verifies the sha256 and refuses a download published
-  without one, then keeps a server alive while you dictate. The graphics card is
+  without one, then keeps a server alive while you dictate and hands the memory
+  back once it has sat unused for ten minutes. The model list is
+  grouped by model rather than by file size, and the row this machine's memory
+  and graphics can take is marked. The graphics card is
   reached through CUDA, ROCm or Vulkan where the build allows. No key, no
-  account, nothing leaving the machine.
+  account, nothing leaving the machine. On x86_64 Linux the same button fetches
+  a Vulkan build of whisper-server that Dikte publishes itself, because
+  upstream's Linux archive is processor-only.
 - **Silence never reaches the API.** Handed near-silence, a transcription model
   invents a sentence instead of returning nothing ("Thanks for watching", or in
   Turkish "Altyazı M.K."). A recording is dropped when nothing rose 10 dB above
@@ -189,11 +204,13 @@ running.
   what comes of it: the answer, or a sentence saying what was done. It is the
   session you would have opened yourself, so your skills and connected services
   are there, which is what makes "put that in my calendar on Thursday at three"
-  a thing you can say to a window that is not Claude. Codex (`codex exec`) runs
-  the same way, and OpenRouter is there as a plain question-and-answer fallback
-  for a machine with neither CLI on it. Provider, model, permissions and working
-  directory are under Settings → Agent, and commands close together stay in one
-  conversation.
+  a thing you can say to a window that is not Claude. Codex (`codex exec`) and
+  Antigravity (`agy -p`) run the same way, though Antigravity takes neither a
+  permission mode nor a sandbox from Dikte: what it may do without asking is
+  whatever its own allow-rules say. OpenRouter or OpenCode Go is there as a
+  plain question-and-answer fallback for a machine with no CLI on it. Provider,
+  model, permissions and working directory are under Settings → Agent, and
+  commands close together stay in one conversation.
 - **Meetings** are recorded from the microphone and the speaker output at the
   same time, which settles who said what by the channel a voice arrived on
   instead of guessing at it. The two sides are transcribed separately and
@@ -209,6 +226,11 @@ running.
   written for subtitles, so the lines keep their place and nothing is shortened.
 - **History** of every dictation under Settings → History, with a size limit and
   right-click to delete.
+- **The speech language is detected, not picked.** Auto is the default: whisper
+  on this machine says what it heard, the hosted providers transcribe in
+  whatever language comes in without being told, and the detected language
+  lands in the history and decides which cleanup prompt (Turkish or the
+  language-agnostic one) a run gets. A fixed language still overrides it.
 - **Turkish and English interface**, following the system locale by default.
 
 ## The global shortcuts, and the logout KDE needs
@@ -240,9 +262,9 @@ cli.py            the command line: every verb, and what it answers with
 ipc.py            one request and one reply over the local socket
 audio.py          PCM capture: pw-record for dictation, ffmpeg for a meeting
 meeting.py        channel split, speaker labelling, cleanup, minutes
-assistant.py      running a dictation through Claude Code, Codex or OpenRouter
+assistant.py      handing a dictation to Claude Code, Codex, agy or a chat model
 api.py            transcription and cleanup requests (stdlib only)
-cleanup.py        who rewrites the transcript: OpenRouter, here, Claude or Codex
+cleanup.py        who rewrites the transcript: a hosted model, one here, a CLI
 ggml.py           whisper.cpp and llama.cpp here: fetch, verify, keep serving
 hub.py            what GitHub and Hugging Face have on offer today
 update.py         whether a newer release is out, and the page it is on

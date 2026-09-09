@@ -1,6 +1,7 @@
 """The small recording indicator that appears in a screen corner without taking focus."""
 
 import math
+import os
 import sys
 
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF
@@ -8,33 +9,68 @@ from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPainterPath, QPen, QF
 from PyQt6.QtWidgets import QWidget, QApplication
 
 from . import mac_window
+from . import theme
 
 BARS = 22
-HEIGHT = 56
+HEIGHT = 48
 MIN_WIDTH = 210
 MAX_WIDTH = 460
 MARGIN = 28
 GAP = 10        # between two indicators sharing a corner
+FOLLOW_EVERY = 8   # ticks between two looks for the pointer: about four a second
 
-BG = QColor(22, 24, 29, 238)
-BORDER = QColor(255, 255, 255, 28)
-TEXT = QColor(235, 237, 242)
-MUTED = QColor(150, 156, 168)
-REC = QColor(240, 78, 82)
-BUSY = QColor(120, 170, 255)
-OK = QColor(80, 205, 140)
-ERR = QColor(240, 100, 90)
-WARN = QColor(240, 180, 80)
-THEM = QColor(110, 190, 255)   # the other side of a meeting
-
-ASK = QColor(150, 140, 255)    # recording a command rather than a dictation
-# Recording, but nothing is going in. The same amber a warning gets, and for
-# the same reason: it is the colour that stops you walking away from it.
-HELD = WARN
-
-STATE_COLORS = {"recording": REC, "asking": ASK, "meeting": REC, "busy": BUSY,
-                "done": OK, "warning": WARN, "error": ERR}
+STATE_ROLES = {"recording": "rec", "asking": "ask", "meeting": "rec", "busy": "accent",
+               "done": "ok", "warning": "warn", "error": "err"}
 LIVE = ("recording", "asking", "meeting")
+
+
+# KWin's interface, kept once one has been built. See _compositor_screen.
+_kwin = None
+
+
+def _compositor_screen():
+    """The screen KWin says the session is on, or None where nothing says.
+
+    Wayland tells a client where the pointer is only while it is over one of
+    that client's own windows, and the indicator is never under the pointer, so
+    QCursor.pos() answers with a stale point or, when the pointer has never
+    been over a window of ours, with the origin. Either way the indicator lands
+    in the corner of whichever screen holds 0,0 instead of the one being worked
+    on, and on a two-monitor desk that is the wrong screen most of the time.
+    KWin does know, and it names outputs the way Qt names screens, by
+    connector, natively and through XWayland alike. No other Wayland desktop
+    answers this, so the rest are left with the pointer, which is right on X11
+    and wrong on Wayland exactly as before.
+
+    What it answers with is the active output, which is the one under the
+    pointer only where Plasma is set to let the active screen follow the mouse.
+    Under the default, click to focus, it is the focused window's screen, so
+    the indicator lands where the typing is going rather than where the mouse
+    was left. Which is why nothing here, and nothing in the settings window,
+    promises the pointer.
+    """
+    global _kwin
+    if _kwin is None or not _kwin.isValid():
+        # Which also leaves macOS and Windows out, where nothing sets it and
+        # the pointer can be asked where it is like anywhere else.
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        if "kde" not in desktop and "plasma" not in desktop:
+            return None
+        try:
+            from PyQt6.QtDBus import QDBusConnection, QDBusInterface
+            _kwin = QDBusInterface("org.kde.KWin", "/KWin", "org.kde.KWin",
+                                   QDBusConnection.sessionBus())
+        except Exception:
+            return None
+        if not _kwin.isValid():
+            return None
+        # A compositor busy enough not to answer in a fifth of a second is one
+        # the indicator should stop waiting for, not one it should freeze with.
+        _kwin.setTimeout(200)
+    answer = _kwin.call("activeOutputName").arguments()
+    name = answer[0] if answer else ""
+    return next((item for item in QApplication.screens() if item.name() == name),
+                None)
 
 
 class Overlay(QWidget):
@@ -43,10 +79,14 @@ class Overlay(QWidget):
     under way at the same time and still both be visible."""
 
     def __init__(self, corner="bottom-left", below=None, dismissable=False,
-                 screen_name=""):
+                 screen_name="", follow_pointer=False, theme_name=theme.DEFAULT):
         super().__init__(None)
+        self.set_theme(theme_name)
         self.corner = corner
         self.screen_name = screen_name
+        # Whether it goes on following the pointer once it is up, rather than
+        # settling on the screen it appeared on.
+        self.follow_pointer = follow_pointer
         self.below = below
         # A job that can run for ten minutes should not have to be watched for
         # ten minutes. Clicking such an indicator puts the progress away; the
@@ -65,6 +105,8 @@ class Overlay(QWidget):
         self.seconds = 0.0
         self._phase = 0.0
         self._concealed = True
+        self._shown_on = ""   # the screen it was last put on, by name
+        self._looks = 0       # ticks since the pointer was last looked for
 
         flags = (
             Qt.WindowType.FramelessWindowHint
@@ -252,16 +294,52 @@ class Overlay(QWidget):
                         min(MAX_WIDTH, metrics.horizontalAdvance(self.message) + extra))
         self.resize(width, HEIGHT)
 
-    def _reposition(self):
-        # The screen the settings name, or, when none is named or it is not
-        # plugged in right now, where the user actually is. Names are connector
-        # names on X11 and model names on macOS, where two identical monitors
-        # can share one; the first then wins.
-        screen = next(
+    def _screen(self):
+        """The screen this indicator belongs on right now.
+
+        The one the settings name, or, when none is named or it is not plugged
+        in right now, where the user actually is. Names are connector names on
+        X11 and model names on macOS, where two identical monitors can share
+        one; the first then wins.
+
+        One stacking on another belongs on that one's screen and nowhere else.
+        Asked for itself it would answer where the user is now, which is not
+        where the ribbon it stacks on was put a minute ago, and the pair would
+        end up a monitor apart with this one raised over nothing.
+        """
+        if self.below is not None and self.below.showing:
+            under = next((item for item in QApplication.screens()
+                          if item.name() == self.below._shown_on), None)
+            if under is not None:
+                return under
+        named = next(
             (item for item in QApplication.screens() if item.name() == self.screen_name),
             None,
         )
-        screen = screen or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        return (named or _compositor_screen()
+                or QApplication.screenAt(QCursor.pos())
+                or QApplication.primaryScreen())
+
+    def _wandered_off(self):
+        """Whether the pointer has left the screen the indicator is on.
+
+        Only asked while it is following, and only every few ticks: the answer
+        costs a word with the compositor, and a hand moving a mouse across a
+        desk is slow next to a 33 ms ribbon. Every tick for one that stacks on
+        another, where the answer is free and waiting a third of a second for
+        it would leave the pair split over two monitors for that long.
+        """
+        if not self.follow_pointer or self.screen_name:
+            return False
+        if self.below is None or not self.below.showing:
+            self._looks = (self._looks + 1) % FOLLOW_EVERY
+            if self._looks:
+                return False
+        return self._screen().name() != self._shown_on
+
+    def _reposition(self):
+        screen = self._screen()
+        self._shown_on = screen.name()
         area = screen.availableGeometry()
         left = "left" in self.corner
         top = "top" in self.corner
@@ -277,8 +355,10 @@ class Overlay(QWidget):
     def _tick(self):
         self._phase += 0.12
         # The one underneath can come and go while this one is up; drop back to
-        # the corner when it does rather than leaving a gap where it was.
-        if self.below is not None and self.below.showing != self._stacked:
+        # the corner when it does rather than leaving a gap where it was. And
+        # the screen under the pointer can change while it is up too.
+        moved = self.below is not None and self.below.showing != self._stacked
+        if moved or self._wandered_off():
             self._reposition()
         if self.state in LIVE and not self.paused:
             # keep the ribbon moving even through a pause in speech
@@ -294,6 +374,15 @@ class Overlay(QWidget):
 
     # ---- painting --------------------------------------------------
 
+    def set_theme(self, name):
+        self.colors = {key: QColor(value) for key, value in theme.palette(name).items()}
+        states = (dict(rec="#D52E3F", ok="#187B4B", err="#BD2735", warn="#946000",
+                       them="#2460A0", ask="#7048B4") if name == "light" else
+                  dict(rec="#F04E52", ok="#50CD8C", err="#F0645A", warn="#F0B450",
+                       them="#6EBEFF", ask="#968CFF"))
+        self.colors.update({key: QColor(value) for key, value in states.items()})
+        self.update()
+
     def paintEvent(self, _event):
         if self.state == "hidden":
             return  # translucent window, nothing drawn means nothing shown
@@ -303,14 +392,14 @@ class Overlay(QWidget):
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
 
         path = QPainterPath()
-        path.addRoundedRect(rect, 15, 15)
-        painter.fillPath(path, BG)
-        painter.setPen(QPen(BORDER, 1))
+        path.addRoundedRect(rect, 12, 12)
+        painter.fillPath(path, self.colors["base"])
+        painter.setPen(QPen(self.colors["border"], 1))
         painter.drawPath(path)
 
-        accent = STATE_COLORS.get(self.state, MUTED)
+        accent = self.colors[STATE_ROLES.get(self.state, "muted")]
         if self._held:
-            accent = HELD
+            accent = self.colors["warn"]
         self._draw_indicator(painter, accent)
 
         if self.state in LIVE:
@@ -386,13 +475,13 @@ class Overlay(QWidget):
         gap = (right - left - BARS * bar_w) / max(1, BARS - 1)
         return left, bar_w, bar_w + gap
 
-    @staticmethod
-    def _bar_colour(shaped, accent):
-        color = QColor(accent if shaped > 0.04 else MUTED)
+    def _bar_colour(self, shaped, accent):
+        color = QColor(accent if shaped > 0.04 else self.colors["muted"])
         color.setAlphaF(0.35 + 0.65 * min(1.0, shaped * 2.2))
         return color
 
-    def _draw_waveform(self, painter, accent=REC):
+    def _draw_waveform(self, painter, accent=None):
+        accent = accent if accent is not None else self.colors["rec"]
         if self.state == "meeting":
             self._draw_dual_waveform(painter)
             return
@@ -418,7 +507,7 @@ class Overlay(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         for i, (mine, theirs) in enumerate(zip(self.levels, self.levels2)):
             x = left + i * step
-            for level, accent, up in ((mine, REC, True), (theirs, THEM, False)):
+            for level, accent, up in ((mine, self.colors["rec"], True), (theirs, self.colors["them"], False)):
                 shaped = min(1.0, level ** 0.55)
                 h = 2.0 + shaped * 12.0
                 y = mid - 1.5 - h if up else mid + 1.5
@@ -430,7 +519,7 @@ class Overlay(QWidget):
         font.setPointSizeF(10.0)
         font.setFamilies(["monospace"])
         painter.setFont(font)
-        painter.setPen(MUTED)
+        painter.setPen(self.colors["muted"])
         mins, secs = divmod(int(self.seconds), 60)
         hours, mins = divmod(mins, 60)
         text = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
@@ -449,7 +538,7 @@ class Overlay(QWidget):
         """A faint cross on the right: without it there is nothing to say the
         box can be clicked away, and a feature nobody can see is not one."""
         cx, cy = self.width() - 18.0, self.height() / 2
-        pen = QPen(QColor(MUTED), 1.6)
+        pen = QPen(QColor(self.colors["muted"]), 1.6)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -458,7 +547,7 @@ class Overlay(QWidget):
 
     def _draw_message(self, painter):
         painter.setFont(self._label_font())
-        painter.setPen({"error": ERR, "warning": WARN}.get(self.state, TEXT))
+        painter.setPen({"error": self.colors["err"], "warning": self.colors["warn"]}.get(self.state, self.colors["text"]))
         # Leave the cross its corner rather than running the text under it.
         box = QRectF(46, 0, self.width() - 60 - (18 if self._can_dismiss else 0),
                      self.height())

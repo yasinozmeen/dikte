@@ -55,6 +55,7 @@ cat > "$APPDIR/dikte.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Dikte
+X-AppImage-Version=$VERSION
 Comment=Voice dictation: record, transcribe, clean up, paste
 Exec=dikte
 Icon=dikte

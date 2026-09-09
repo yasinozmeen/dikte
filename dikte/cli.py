@@ -30,6 +30,7 @@ from . import audio
 from . import cleanup
 from . import config as cfg
 from . import filetranscribe
+from . import ggml
 from . import hotkey
 from . import hub
 from . import ipc
@@ -44,7 +45,7 @@ NOT_RUNNING = 3
 # Verbs that start the application when none is running, which is what a
 # shortcut registered with the desktop has always relied on: press the key on a
 # fresh login and Dikte comes up recording.
-GUI_VERBS = {"", "settings", "toggle", "ask", "meeting"}
+GUI_VERBS = {"", "home", "settings", "toggle", "ask", "meeting"}
 
 # Asking a process that is not there to stop, cancel or quit is not a failure;
 # it is already in the state that was asked for.
@@ -216,7 +217,9 @@ def cmd_ask(opts):
         conf["assistant_provider"] = opts.provider
     if opts.model:
         key = {"claude": "assistant_model", "codex": "assistant_codex_model",
-               "openrouter": "assistant_openrouter_model"}[assistant.provider(conf)]
+               "openrouter": "assistant_openrouter_model",
+               "agy": "assistant_agy_model",
+               "opencode": "assistant_opencode_model"}[assistant.provider(conf)]
         conf[key] = opts.model
     if opts.dir:
         conf["assistant_dir"] = opts.dir
@@ -255,7 +258,8 @@ def cmd_ask(opts):
         "cleanup_error": warning,
         "mode": "ask",
         "question": text,
-        "assistant_model": conf["assistant_model"],
+        "assistant": assistant.provider(conf),
+        "assistant_model": assistant.model(conf),
         "raw": text,
         "text": answer,
     })
@@ -508,7 +512,8 @@ def cmd_history_clear(opts):
 
 # --- settings ---------------------------------------------------------------
 
-SECRET_KEYS = ("openai_api_key", "groq_api_key", "openrouter_api_key")
+SECRET_KEYS = ("openai_api_key", "groq_api_key", "openrouter_api_key",
+               "gemini_api_key", "opencode_api_key")
 
 
 def _mask(key, value):
@@ -698,6 +703,22 @@ def cmd_test_key(opts):
             results[name] = {"ok": True, "message": message}
         except api.ApiError as exc:
             results[name] = {"ok": False, "message": str(exc)}
+    if opts.which in ("gemini", "all"):
+        try:
+            count = len(api.gemini_models(conf.gemini_key(),
+                                          conf["gemini_base_url"]))
+            message = f"connection works, {count} models visible"
+            results["gemini"] = {"ok": True, "message": message}
+        except api.ApiError as exc:
+            results["gemini"] = {"ok": False, "message": str(exc)}
+    if opts.which in ("opencode", "all"):
+        try:
+            count = len(api.openai_models(conf.opencode_key(),
+                                          conf["opencode_base_url"], "OpenCode Go"))
+            results["opencode"] = {"ok": True,
+                                   "message": f"connection works, {count} models visible"}
+        except api.ApiError as exc:
+            results["opencode"] = {"ok": False, "message": str(exc)}
     everything_ok = all(item["ok"] for item in results.values())
     lines = [f"{'✓' if item['ok'] else '✗'} {name}: {item['message']}"
              for name, item in results.items()]
@@ -816,6 +837,69 @@ def cmd_update(opts):
                f"{release.url}")
 
 
+# --- the models on this machine --------------------------------------------
+
+
+def _local_where(entry):
+    """Where a local model ran, in a phrase: the card, the processor, or neither.
+
+    The backend and the card keep the names the server printed for them. A
+    graphics card is a product somebody sells under that name, and translating
+    it would be inventing hardware.
+    """
+    kind = ggml.accel_kind({**entry, "running": True})
+    where = {"gpu": "the graphics card", "cpu": "the processor"}.get(
+        kind, "something it did not name")
+    detail = ggml.accel_detail(entry)
+    return where + (f" ({detail})" if detail else "")
+
+
+def _local_note(entry):
+    """What the log establishes when GPU use was requested but unavailable."""
+    if not entry.get("gpu_wanted"):
+        return ""
+    if ggml.accel_kind({**entry, "running": True}) != "cpu":
+        return ""
+    if not ggml.cpu_only_loaded(entry):
+        return "  - the graphics card is switched on but could not be used"
+    return ("  - only the CPU backend was loaded; check the server log for "
+            "graphics backend or driver errors")
+
+
+def _local_line(name, entry):
+    if not entry.get("running"):
+        return "not loaded"
+    model = entry.get("model") or ""
+    return (f"loaded on {_local_where(entry)}"
+            + (f", {model}" if model else "") + _local_note(entry))
+
+
+def _last_local(conf):
+    """What the local servers last ran on, read off the logs they left behind.
+
+    For a command line asking while nothing is running: there is no process to
+    put the question to, and the log outlives the process that wrote it. Every
+    entry says `running` is false, because this is an account of the last start
+    rather than a reading of a live one. The logs do not record the binary path
+    or requested GPU setting, so current settings cannot explain that run.
+    """
+    rows = {}
+    for program, used in (
+            (ggml.WHISPER, conf["transcribe_provider"] == "local"),
+            (ggml.LLAMA, conf.uses_local_llm())):
+        accel = ggml.last_accel(program)
+        rows[program.name] = {
+            # Whether one ever started here at all, which the backend cannot
+            # say on its own: a server that ran and named no backend and one
+            # that never ran both leave it empty.
+            "ran": ggml.server_log(program).exists(),
+            "running": False, "used": used,
+            "backend": accel.backend, "device": accel.device,
+            "layers": accel.layers, "available": list(accel.available),
+        }
+    return rows
+
+
 def cmd_status(opts):
     reply = ipc.send("status")
     if reply is None:
@@ -835,6 +919,11 @@ def cmd_status(opts):
         + (f"  {reply['meeting_message']}" if reply.get("meeting_message") else ""),
         f"listener:  {'on' if reply.get('listener') else 'off'}",
     ]
+    # Nothing for a setup that uses no model on this machine, and nothing at all
+    # from an instance too old to have been asked.
+    for name, entry in (reply.get("local") or {}).items():
+        if entry.get("used") or entry.get("running"):
+            lines.append(f"{name + ':':11}{_local_line(name, entry)}")
     return out(opts, reply, "\n".join(lines))
 
 
@@ -847,13 +936,16 @@ def cmd_doctor(opts):
     # Mac shells out for one half and Windows for neither. A row saying ydotool
     # is missing on a machine that would never have run it is not a diagnosis,
     # it is a red mark to explain away.
+    # Asked once and read twice: whether an instance is running, and what its
+    # local servers are doing, which is a question only that process can answer.
+    live = ipc.send("status") or {}
     here = paste.desktop()
     wanted = [here.clipboard, here.keyboard]
     if sys.platform.startswith("linux"):
         # Recording, the device list, and KDE's shortcut registry.
         wanted += ["pw-record", "pactl", "kwriteconfig6"]
     wanted += ["ffmpeg",
-               assistant.executable(assistant.provider(conf)) or "claude",
+               assistant.executable(assistant.provider(conf)),
                cleanup.executable(cleanup.provider(conf))]
     programs = {name: shutil.which(name) or "" for name in wanted if name}
     target = conf.transcribe_target()
@@ -862,8 +954,17 @@ def cmd_doctor(opts):
     # and marking them by the key they do not use reported every fully local
     # setup as broken.
     transcribe_ready = conf.transcribe_ready()
-    if cleaner == "openrouter":
-        cleanup_ready = bool(conf.openrouter_key())
+    # Only the ones that answer over HTTP have a key worth looking at. A CLI
+    # has a program to find instead, and the model on this machine has neither,
+    # so "no key" there has to read as beside the point rather than as one that
+    # has gone missing.
+    cleanup_service, cleanup_key = {
+        "openrouter": ("OpenRouter", conf.openrouter_key()),
+        "gemini": ("Google AI Studio", conf.gemini_key()),
+        "opencode": ("OpenCode Go", conf.opencode_key()),
+    }.get(cleaner, ("", ""))
+    if cleanup_service:
+        cleanup_ready = bool(cleanup_key)
     elif cleaner == "local":
         cleanup_ready = conf.local_llm_ready()
     else:
@@ -875,21 +976,27 @@ def cmd_doctor(opts):
                           "ready": transcribe_ready},
         "cleanup": {"enabled": conf["cleanup_enabled"], "provider": cleaner,
                     "model": cleanup.model(conf),
-                    "key": bool(conf.openrouter_key()),
+                    "key": bool(cleanup_key) if cleanup_service else None,
                     "ready": cleanup_ready},
         "agent": {"provider": assistant.provider(conf),
                   "directory": assistant.working_dir(conf)},
-        "running": ipc.send("status") is not None,
+        "running": bool(live),
+        # Live when there is an instance to ask, off the logs when there is not.
+        "local": live.get("local") or _last_local(conf),
     }
+    # An instance from before this field existed is not an instance saying
+    # nothing is loaded; it is one that cannot be asked, and the two must not
+    # print the same line.
+    stale = bool(live) and "local" not in live
     if target.provider == "local":
         transcribe_line = (f"{'✓' if transcribe_ready else '✗'} {target.service}, "
                            f"transcribing on {target.model or 'no model yet'}")
     else:
         transcribe_line = (f"{'✓' if transcribe_ready else '✗'} {target.service} "
                            f"key, transcribing on {target.model}")
-    if cleaner == "openrouter":
-        cleanup_line = (f"{'✓' if cleanup_ready else '✗'} OpenRouter key, "
-                        f"cleaning up on {conf['cleanup_model']}")
+    if cleanup_service:
+        cleanup_line = (f"{'✓' if cleanup_ready else '✗'} {cleanup_service} key, "
+                        f"cleaning up on {cleanup.model(conf)}")
     elif cleaner == "local":
         cleanup_line = (f"{'✓' if cleanup_ready else '✗'} Local model, "
                         f"cleaning up on {conf['local_llm_model'] or 'no model yet'}")
@@ -900,12 +1007,30 @@ def cmd_doctor(opts):
                         f"{cleanup.model(conf)}")
     lines = [f"{'✓' if path else '✗'} {name:14} {path or 'not on your PATH'}"
              for name, path in programs.items()]
-    lines += [
-        transcribe_line,
-        cleanup_line,
+    lines += [transcribe_line, cleanup_line]
+    # Only the models this setup actually uses: a machine transcribing in the
+    # cloud has nothing loaded here and no reason to read about it.
+    for name, entry in checks["local"].items():
+        if not entry.get("used"):
+            continue
+        if stale:
+            lines.append(f"· {name:14} the running instance is too old to say; "
+                         f"reload it with: dikte restart")
+        elif entry.get("running"):
+            lines.append(f"✓ {name:14} {_local_line(name, entry)}")
+        elif live:
+            lines.append(f"· {name:14} not loaded")
+        elif entry.get("backend"):
+            lines.append(f"· {name:14} last run on "
+                         f"{_local_where(entry)}")
+        elif entry.get("ran"):
+            lines.append(f"· {name:14} last run said nothing about what it "
+                         f"was running on")
+        else:
+            lines.append(f"· {name:14} never run here")
+    lines.append(
         f"{'✓' if checks['running'] else '·'} application "
-        + ("running" if checks["running"] else "not running"),
-    ]
+        + ("running" if checks["running"] else "not running"))
     return out(opts, {"ok": True, **checks}, "\n".join(lines))
 
 
@@ -990,7 +1115,7 @@ def build_parser():
     ask = leaf(subs, "ask", "put a command to the agent")
     ask.add_argument("text", nargs="*", help="the command; read from stdin, or "
                                              "recorded when there is none")
-    ask.add_argument("--provider", choices=("claude", "codex", "openrouter"),
+    ask.add_argument("--provider", choices=assistant.PROVIDERS,
                      help="just for this run")
     ask.add_argument("--model", help="just for this run")
     ask.add_argument("--dir", help="working directory, just for this run")
@@ -1116,7 +1241,7 @@ def build_parser():
     models.set_defaults(func=cmd_models)
     test = leaf(subs, "test-key", "check the API keys")
     test.add_argument("which", nargs="?", default="all",
-                      choices=("all", *cfg.TRANSCRIBERS))
+                      choices=("all", *cfg.TRANSCRIBERS, "gemini", "opencode"))
     test.set_defaults(func=cmd_test_key)
     leaf(subs, "doctor", "keys, programs, and what is missing").set_defaults(func=cmd_doctor)
 
@@ -1150,7 +1275,7 @@ def build_parser():
     updates.set_defaults(func=cmd_update)
 
     leaf(subs, "status", "what it is doing right now").set_defaults(func=cmd_status)
-    for name, help_text in (("settings", "open the settings window"),
+    for name, help_text in (("home", "open Dikte"), ("settings", "open the settings window"),
                             ("restart", "reload the running instance"),
                             ("quit", "shut it down")):
         leaf(subs, name, help_text).set_defaults(func=cmd_plain)
@@ -1181,8 +1306,8 @@ def run(argv):
                 pass
     parser = build_parser()
     opts = parser.parse_args(argv)
-    # No verb at all is the plain `dikte`, which means the settings window.
-    opts.verb = opts.verb or ""
+    # No verb opens the daily workspace; settings remains an explicit verb.
+    opts.verb = opts.verb or "home"
     # Every path here either talks over the socket or drives one of the workers,
     # and both want an event loop under them; a window is what none of them want.
     _app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])

@@ -283,11 +283,20 @@ def to_srt(text, segments):
         hours, minutes, secs = (int(g or 0) for g in match.groups())
         cues.append([hours * 3600 + minutes * 60 + secs, None, body])
 
+    # Several cues can share a whole second, so a second holds every segment
+    # that began in it and they are handed out in the order they were spoken.
     timing = {}
     for start, end, _ in segments:
-        timing.setdefault(int(start), (start, end))
+        timing.setdefault(int(start), []).append((start, end))
     for cue in cues:
-        cue[0], cue[1] = timing.get(cue[0], (float(cue[0]), 0.0))
+        found = timing.get(cue[0])
+        if found:
+            # The last one stays, so a second with more lines than it has
+            # timings hands the last of them out again rather than falling back
+            # to the bare second, which would run backwards from the line above.
+            cue[0], cue[1] = found.pop(0) if len(found) > 1 else found[0]
+        else:
+            cue[0], cue[1] = float(cue[0]), 0.0
     for index, cue in enumerate(cues):
         following = cues[index + 1][0] if index + 1 < len(cues) else 0.0
         if following > cue[0]:
